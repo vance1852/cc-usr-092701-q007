@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -174,6 +174,38 @@ CREATE TABLE IF NOT EXISTS appointments (
 );
 CREATE INDEX IF NOT EXISTS appointments_schedule ON appointments(clinic_id,starts_at,ends_at,state);
 CREATE INDEX IF NOT EXISTS appointments_patient ON appointments(patient_id,starts_at DESC);
+CREATE TABLE IF NOT EXISTS clinic_resources (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    kind TEXT NOT NULL CHECK(kind IN ('room','device')),
+    name TEXT NOT NULL,
+    -- 结束后需要的清洁/恢复准备分钟数；房间必须为正数，设备可为 0。
+    turnover_minutes INTEGER NOT NULL DEFAULT 0 CHECK(turnover_minutes>=0 AND turnover_minutes<=1440),
+    state TEXT NOT NULL CHECK(state IN ('active','disabled')),
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(clinic_id,name)
+);
+CREATE INDEX IF NOT EXISTS clinic_resources_lookup ON clinic_resources(clinic_id,kind,state);
+CREATE TABLE IF NOT EXISTS appointment_resources (
+    id TEXT PRIMARY KEY,
+    appointment_id TEXT NOT NULL REFERENCES appointments(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    resource_id TEXT NOT NULL REFERENCES clinic_resources(id),
+    -- 占用窗口含清洁/恢复准备：[blocked_from,blocked_until)。
+    blocked_from TEXT NOT NULL,
+    blocked_until TEXT NOT NULL,
+    resource_version INTEGER NOT NULL,
+    released_at TEXT,
+    release_reason TEXT,
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS appointment_resources_active
+    ON appointment_resources(appointment_id,resource_id) WHERE released_at IS NULL;
+CREATE INDEX IF NOT EXISTS appointment_resources_resource_time
+    ON appointment_resources(clinic_id,resource_id,blocked_from,blocked_until);
+CREATE INDEX IF NOT EXISTS appointment_resources_appointment ON appointment_resources(appointment_id,released_at);
 CREATE TABLE IF NOT EXISTS products (
     id TEXT PRIMARY KEY,
     clinic_id TEXT NOT NULL REFERENCES clinics(id),

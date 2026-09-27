@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import secrets
 from typing import Any
@@ -37,11 +37,13 @@ class Careflow:
         from .exports import PatientExportService
         from .milestones import MilestoneService
         from .clinical_flags import ClinicalFlagService
+        from .resources import ResourceService
         self.supplies = SupplyService(self.db, self.clock)
         self.reports = ReportService(self.db, self.clock)
         self.exports = PatientExportService(self.db, self.clock)
         self.milestones = MilestoneService(self.db, self.clock)
         self.clinical_flags = ClinicalFlagService(self.db, self.clock)
+        self.resources = ResourceService(self.db, self.clock)
 
     def now(self) -> str:
         return timestamp(self.clock.now())
@@ -526,6 +528,7 @@ class Careflow:
     def create_appointment(self, clinic_id: str, actor_id: str, patient_id: str, kind: str,
                            starts_at: str, ends_at: str, idempotency_key: str, *,
                            staff_id: str | None = None, plan_id: str | None = None,
+                           resource_ids: list[str] | None = None,
                            hold_minutes: int = 10) -> dict[str, Any]:
         starts = timestamp(starts_at, "开始时间")
         ends = timestamp(ends_at, "结束时间")
@@ -537,8 +540,13 @@ class Careflow:
             raise ValidationError("预约占位时间必须为 1 至 60 分钟")
         key = require_idempotency_key(idempotency_key)
         kind = text(kind, "预约类型", maximum=100)
+        if resource_ids is None:
+            resource_ids = []
+        if not isinstance(resource_ids, list):
+            raise ValidationError("资源编号必须为数组")
+        resource_ids = sorted({str(item) for item in resource_ids})
         body = {"clinic_id": clinic_id, "patient_id": patient_id, "kind": kind, "starts_at": starts,
-                "ends_at": ends, "staff_id": staff_id, "plan_id": plan_id}
+                "ends_at": ends, "staff_id": staff_id, "plan_id": plan_id, "resource_ids": resource_ids}
         body_hash = request_digest(body)
         now = self.now()
         appointment_id = new_id("apt")
@@ -547,9 +555,13 @@ class Careflow:
             authorize(principal_for(connection, actor_id, clinic_id), "appointment:write", clinic_id=clinic_id)
             existing = connection.execute("SELECT * FROM appointments WHERE clinic_id=? AND idempotency_key=?", (clinic_id, key)).fetchone()
             if existing:
-                if existing["patient_id"] != patient_id or existing["starts_at"] != starts or existing["ends_at"] != ends or existing["kind"] != kind or existing["staff_id"] != staff_id or existing["plan_id"] != plan_id:
+                held_resources = {row[0] for row in connection.execute(
+                    "SELECT resource_id FROM appointment_resources WHERE appointment_id=?", (existing["id"],)).fetchall()}
+                if existing["patient_id"] != patient_id or existing["starts_at"] != starts or existing["ends_at"] != ends or existing["kind"] != kind or existing["staff_id"] != staff_id or existing["plan_id"] != plan_id or held_resources != set(resource_ids):
                     raise Conflict("幂等编号已被不同预约内容使用")
-                return self._appointment_result(existing, replayed=True)
+                result = self._appointment_result(existing, replayed=True)
+                result["resources"] = self._resource_summary(connection, existing["id"])
+                return result
             patient = connection.execute("SELECT state FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone()
             if patient is None:
                 raise NotFound("患者不存在")
@@ -559,31 +571,46 @@ class Careflow:
                 staff = connection.execute("SELECT active FROM staff WHERE id=? AND clinic_id=?", (staff_id, clinic_id)).fetchone()
                 if staff is None or not staff["active"]:
                     raise ValidationError("预约人员不存在或已停用")
-                overlap = connection.execute(
-                    "SELECT id FROM appointments WHERE clinic_id=? AND staff_id=? AND state IN ('held','booked','arrived','in_service') "
-                    "AND starts_at<? AND ends_at>? AND (hold_expires_at IS NULL OR hold_expires_at>?)",
-                    (clinic_id, staff_id, ends, starts, now)).fetchone()
-                if overlap:
-                    raise Conflict("工作人员在该时段已有预约", details={"appointment_id": overlap["id"]})
             if plan_id:
                 plan = connection.execute("SELECT state,patient_id FROM plans WHERE id=? AND clinic_id=?", (plan_id, clinic_id)).fetchone()
                 if plan is None or plan["patient_id"] != patient_id or plan["state"] not in {"proposed", "active"}:
                     raise Conflict("预约关联的计划不存在或当前不可履约")
+            resources = self.resources.require_resources(connection, clinic_id, resource_ids)
+            conflicts = self.resources.find_conflicts(connection, clinic_id, starts, ends, resources,
+                                                      staff_id=staff_id, now=now)
+            if conflicts:
+                raise Conflict("预约与现有人员、诊室或设备占用冲突",
+                               details={"conflicts": conflicts})
             connection.execute(
                 "INSERT INTO appointments(id,clinic_id,patient_id,plan_id,staff_id,kind,starts_at,ends_at,state,hold_expires_at,idempotency_key,created_by,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,'held',?,?,?,?)",
                 (appointment_id, clinic_id, patient_id, plan_id, staff_id, kind, starts, ends, expires, key, actor_id, now))
+            self.resources.hold_resources(connection, clinic_id, appointment_id, starts, ends, resources, now)
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=patient_id,
                                aggregate_type="appointment", aggregate_id=appointment_id, action="appointment.held",
-                               occurred_at=now, payload={"starts_at": starts, "ends_at": ends, "hold_expires_at": expires})
+                               occurred_at=now, payload={"starts_at": starts, "ends_at": ends,
+                                                         "hold_expires_at": expires, "resource_ids": resource_ids})
             row = connection.execute("SELECT * FROM appointments WHERE id=?", (appointment_id,)).fetchone()
-        return self._appointment_result(row, replayed=False)
+            result = self._appointment_result(row, replayed=False)
+            result["resources"] = self._resource_summary(connection, appointment_id)
+        return result
 
     @staticmethod
     def _appointment_result(row, *, replayed: bool) -> dict[str, Any]:
         return {"id": row["id"], "patient_id": row["patient_id"], "kind": row["kind"],
                 "starts_at": row["starts_at"], "ends_at": row["ends_at"], "state": row["state"],
                 "hold_expires_at": row["hold_expires_at"], "version": row["version"], "replayed": replayed}
+
+    def _resource_summary(self, connection, appointment_id: str) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            "SELECT ar.resource_id,ar.blocked_from,ar.blocked_until,ar.resource_version,"
+            "ar.released_at,r.kind,r.name "
+            "FROM appointment_resources ar JOIN clinic_resources r ON r.id=ar.resource_id "
+            "WHERE ar.appointment_id=? ORDER BY r.kind,r.name", (appointment_id,)).fetchall()
+        return [{"id": row["resource_id"], "kind": row["kind"], "name": row["name"],
+                 "blocked_from": row["blocked_from"], "blocked_until": row["blocked_until"],
+                 "resource_version": row["resource_version"], "released_at": row["released_at"]}
+                for row in rows]
 
     def transition_appointment(self, clinic_id: str, actor_id: str, appointment_id: str,
                                expected_version: int, action: str, *, reason: str | None = None) -> dict[str, Any]:
@@ -595,6 +622,7 @@ class Careflow:
         if action in {"cancel", "no_show"}:
             reason = text(reason or "", "原因", maximum=600)
         now = self.now()
+        book_failure: dict[str, Any] | None = None
         with self.db.transaction() as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "appointment:write", clinic_id=clinic_id)
             appointment = connection.execute("SELECT * FROM appointments WHERE id=? AND clinic_id=?", (appointment_id, clinic_id)).fetchone()
@@ -610,15 +638,77 @@ class Careflow:
             if action == "complete" and parsed_timestamp(appointment["ends_at"]) > parsed_timestamp(now):
                 raise Conflict("预约尚未到结束时间")
             version = appointment["version"] + 1
-            connection.execute("UPDATE appointments SET state=?,version=? WHERE id=?", (after, version, appointment_id))
-            if action == "start":
-                encounter_id = new_id("enc")
-                connection.execute("INSERT INTO encounters(id,appointment_id,patient_id,clinic_id,state,opened_by,opened_at) VALUES(?,?,?,?,'open',?,?)",
-                                   (encounter_id, appointment_id, appointment["patient_id"], clinic_id, actor_id, now))
-            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=appointment["patient_id"],
-                               aggregate_type="appointment", aggregate_id=appointment_id, action=f"appointment.{action}",
-                               occurred_at=now, payload={"from": appointment["state"], "to": after, "reason": reason, "version": version})
+            if action == "book":
+                # 确认前复核人员、房间与设备：任一资源版本变化或出现新冲突，
+                # 整次确认失败并在同一事务内释放全部临时占位。
+                stale, conflicts = self._revalidate_booking(connection, clinic_id, appointment, now)
+                if stale or conflicts:
+                    released = self.resources.release_resources(connection, appointment_id, now, "book_failed")
+                    connection.execute("UPDATE appointments SET state='cancelled',version=? WHERE id=?",
+                                       (version, appointment_id))
+                    audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id,
+                                       patient_id=appointment["patient_id"],
+                                       aggregate_type="appointment", aggregate_id=appointment_id,
+                                       action="appointment.book_failed", occurred_at=now,
+                                       payload={"stale_resources": stale, "conflicts": conflicts,
+                                                "resources_released": released, "version": version})
+                    book_failure = {"stale_resources": stale, "conflicts": conflicts}
+            if book_failure is None:
+                connection.execute("UPDATE appointments SET state=?,version=? WHERE id=?", (after, version, appointment_id))
+                if action == "start":
+                    encounter_id = new_id("enc")
+                    connection.execute("INSERT INTO encounters(id,appointment_id,patient_id,clinic_id,state,opened_by,opened_at) VALUES(?,?,?,?,'open',?,?)",
+                                       (encounter_id, appointment_id, appointment["patient_id"], clinic_id, actor_id, now))
+                released: dict[str, Any] | int = 0
+                if action == "cancel":
+                    # 取消：全部资源立即释放。
+                    released = self.resources.release_resources(connection, appointment_id, now, "cancelled")
+                elif action == "no_show":
+                    # 未到诊：设备立即释放；房间保留至原定结束时刻，为迟到到达留缓冲。
+                    released = self.resources.release_after_service(
+                        connection, appointment_id, now, "no_show", room_until=appointment["ends_at"])
+                elif action == "complete":
+                    # 完成服务：设备立即释放；房间保留至清洁准备窗口结束。
+                    room_until = self._room_turnover_until(connection, appointment, now)
+                    released = self.resources.release_after_service(
+                        connection, appointment_id, now, "completed", room_until=room_until)
+                audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=appointment["patient_id"],
+                                   aggregate_type="appointment", aggregate_id=appointment_id, action=f"appointment.{action}",
+                                   occurred_at=now, payload={"from": appointment["state"], "to": after, "reason": reason,
+                                                             "version": version, "resources_released": released})
+        if book_failure is not None:
+            raise Conflict("预约所需人员、诊室或设备在确认前已变化，临时占位已释放",
+                           details=book_failure)
         return {"id": appointment_id, "state": after, "version": version, "updated_at": now}
+
+    def _room_turnover_until(self, connection, appointment, now: str) -> str:
+        """完成服务后房间应保留到的最晚清洁准备结束时刻；无房间时退为预约结束。"""
+        row = connection.execute(
+            "SELECT MAX(ar.blocked_until) AS until_value FROM appointment_resources ar "
+            "JOIN clinic_resources r ON r.id=ar.resource_id "
+            "WHERE ar.appointment_id=? AND r.kind='room' AND (ar.released_at IS NULL OR ar.released_at>?)",
+            (appointment["id"], now)).fetchone()
+        return row["until_value"] or appointment["ends_at"]
+
+    def _revalidate_booking(self, connection, clinic_id: str, appointment, now: str):
+        links = connection.execute(
+            "SELECT ar.resource_id,ar.resource_version,r.name,r.kind,r.version AS current_version,r.state AS resource_state "
+            "FROM appointment_resources ar JOIN clinic_resources r ON r.id=ar.resource_id "
+            "WHERE ar.appointment_id=? AND ar.released_at IS NULL", (appointment["id"],)).fetchall()
+        stale = [{"resource": {"kind": row["kind"], "id": row["resource_id"], "name": row["name"]},
+                  "held_version": row["resource_version"], "current_version": row["current_version"],
+                  "resource_state": row["resource_state"]}
+                 for row in links
+                 if row["current_version"] != row["resource_version"] or row["resource_state"] != "active"]
+        if stale:
+            return stale, []
+        resources = self.resources.require_resources(connection, clinic_id,
+                                                     [row["resource_id"] for row in links])
+        conflicts = self.resources.find_conflicts(connection, clinic_id, appointment["starts_at"],
+                                                  appointment["ends_at"], resources,
+                                                  staff_id=appointment["staff_id"], now=now,
+                                                  exclude_appointment_id=appointment["id"])
+        return [], conflicts
 
     def encounter_for_appointment(self, clinic_id: str, actor_id: str, appointment_id: str) -> dict[str, Any]:
         with self.db.transaction(write=False) as connection:
@@ -743,10 +833,134 @@ class Careflow:
                 (clinic_id, now, limit)).fetchall()
             for row in rows:
                 connection.execute("UPDATE appointments SET state='cancelled',version=version+1 WHERE id=? AND state='held'", (row["id"],))
+                released = self.resources.release_resources(connection, row["id"], now, "hold_expired")
                 audit.append_event(connection, clinic_id=clinic_id, actor_id=None, patient_id=row["patient_id"],
                                    aggregate_type="appointment", aggregate_id=row["id"], action="appointment.hold_expired",
-                                   occurred_at=now, payload={"hold_expires_at": row["hold_expires_at"]})
+                                   occurred_at=now, payload={"hold_expires_at": row["hold_expires_at"],
+                                                             "resources_released": released})
         return {"expired": len(rows), "as_of": now}
+
+    def reschedule_appointment(self, clinic_id: str, actor_id: str, appointment_id: str,
+                               expected_version: int, starts_at: str, ends_at: str, *,
+                               resource_ids: list[str] | None = None,
+                               reason: str | None = None) -> dict[str, Any]:
+        """原子改期：同一事务内释放旧占用并锁定新窗口；任何冲突都会回滚，原预约保持不变。"""
+        starts = timestamp(starts_at, "开始时间")
+        ends = timestamp(ends_at, "结束时间")
+        if parsed_timestamp(ends) <= parsed_timestamp(starts):
+            raise ValidationError("结束时间必须晚于开始时间")
+        if parsed_timestamp(starts) <= parsed_timestamp(self.now()):
+            raise ValidationError("不能改期到已过去的时间")
+        if reason is not None:
+            reason = text(reason, "改期原因", maximum=600)
+        if resource_ids is not None:
+            if not isinstance(resource_ids, list):
+                raise ValidationError("资源编号必须为数组")
+            resource_ids = sorted({str(item) for item in resource_ids})
+        now = self.now()
+        with self.db.transaction() as connection:
+            authorize(principal_for(connection, actor_id, clinic_id), "appointment:write", clinic_id=clinic_id)
+            appointment = connection.execute("SELECT * FROM appointments WHERE id=? AND clinic_id=?", (appointment_id, clinic_id)).fetchone()
+            if appointment is None:
+                raise NotFound("预约不存在")
+            require_match(appointment["version"], expected_version, "预约")
+            if appointment["state"] not in {"held", "booked"}:
+                raise Conflict("预约当前状态不允许改期", details={"state": appointment["state"]})
+            if appointment["state"] == "held" and appointment["hold_expires_at"] \
+                    and parsed_timestamp(appointment["hold_expires_at"]) <= parsed_timestamp(now):
+                raise Conflict("预约占位已过期")
+            if resource_ids is None:
+                resource_ids = sorted(row[0] for row in connection.execute(
+                    "SELECT resource_id FROM appointment_resources WHERE appointment_id=? AND released_at IS NULL",
+                    (appointment_id,)).fetchall())
+            resources = self.resources.require_resources(connection, clinic_id, resource_ids)
+            conflicts = self.resources.find_conflicts(connection, clinic_id, starts, ends, resources,
+                                                      staff_id=appointment["staff_id"], now=now,
+                                                      exclude_appointment_id=appointment_id)
+            if conflicts:
+                # 抛出后事务回滚，旧占用与原时段保持不变。
+                raise Conflict("改期目标时段与现有人员、诊室或设备占用冲突，原预约已保留",
+                               details={"conflicts": conflicts})
+            released = self.resources.release_resources(connection, appointment_id, now, "rescheduled")
+            self.resources.hold_resources(connection, clinic_id, appointment_id, starts, ends, resources, now)
+            version = appointment["version"] + 1
+            connection.execute("UPDATE appointments SET starts_at=?,ends_at=?,version=? WHERE id=?",
+                               (starts, ends, version, appointment_id))
+            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id,
+                               patient_id=appointment["patient_id"],
+                               aggregate_type="appointment", aggregate_id=appointment_id,
+                               action="appointment.rescheduled", occurred_at=now,
+                               payload={"from": {"starts_at": appointment["starts_at"], "ends_at": appointment["ends_at"]},
+                                        "to": {"starts_at": starts, "ends_at": ends},
+                                        "resource_ids": resource_ids, "resources_released": released,
+                                        "reason": reason, "version": version})
+        return {"id": appointment_id, "state": appointment["state"], "starts_at": starts, "ends_at": ends,
+                "resource_ids": resource_ids, "version": version, "updated_at": now}
+
+    def appointment_conflicts(self, clinic_id: str, actor_id: str, starts_at: str, ends_at: str, *,
+                              staff_id: str | None = None, resource_ids: list[str] | None = None,
+                              exclude_appointment_id: str | None = None) -> dict[str, Any]:
+        """运营查询：说明候选时段的冲突来自哪个资源与哪个时间段。"""
+        starts = timestamp(starts_at, "开始时间")
+        ends = timestamp(ends_at, "结束时间")
+        if parsed_timestamp(ends) <= parsed_timestamp(starts):
+            raise ValidationError("结束时间必须晚于开始时间")
+        if resource_ids is None:
+            resource_ids = []
+        if not isinstance(resource_ids, list):
+            raise ValidationError("资源编号必须为数组")
+        with self.db.transaction(write=False) as connection:
+            authorize(principal_for(connection, actor_id, clinic_id), "appointment:read", clinic_id=clinic_id)
+            resources = self.resources.require_resources(connection, clinic_id, resource_ids)
+            conflicts = self.resources.find_conflicts(connection, clinic_id, starts, ends, resources,
+                                                      staff_id=staff_id, now=self.now(),
+                                                      exclude_appointment_id=exclude_appointment_id)
+            for item in conflicts:
+                item["blocked_local_from"] = self.resources.local_view(connection, clinic_id, item["blocked_from"])["local"]
+                item["blocked_local_until"] = self.resources.local_view(connection, clinic_id, item["blocked_until"])["local"]
+            window = self.resources.local_view(connection, clinic_id, starts)
+            return {"window": {"starts_at": starts, "ends_at": ends,
+                               "local_starts_at": window["local"],
+                               "local_ends_at": self.resources.local_view(connection, clinic_id, ends)["local"],
+                               "timezone": window["timezone"]},
+                    "conflicts": conflicts}
+
+    def appointment_calendar(self, clinic_id: str, actor_id: str, day: str) -> dict[str, Any]:
+        """按诊所当地日期展示预约；跨午夜或夏令时切换的预约按诊所时区换算本地起止。"""
+        local_day = date.fromisoformat(calendar_date(day, "日期"))
+        with self.db.transaction(write=False) as connection:
+            authorize(principal_for(connection, actor_id, clinic_id), "appointment:read", clinic_id=clinic_id)
+            zone = self.resources.clinic_zone(connection, clinic_id)
+            window_start = datetime.combine(local_day, datetime.min.time(), zone).astimezone(UTC)
+            window_end = datetime.combine(local_day + timedelta(days=1), datetime.min.time(), zone).astimezone(UTC)
+            start_text, end_text = timestamp(window_start), timestamp(window_end)
+            rows = connection.execute(
+                "SELECT * FROM appointments WHERE clinic_id=? AND state NOT IN ('cancelled','no_show') "
+                "AND starts_at<? AND ends_at>? ORDER BY starts_at,id",
+                (clinic_id, end_text, start_text)).fetchall()
+            items = []
+            for row in rows:
+                links = connection.execute(
+                    "SELECT ar.blocked_from,ar.blocked_until,r.kind,r.name FROM appointment_resources ar "
+                    "JOIN clinic_resources r ON r.id=ar.resource_id "
+                    "WHERE ar.appointment_id=? AND (ar.released_at IS NULL OR ar.released_at>?) "
+                    "ORDER BY r.kind,r.name", (row["id"], self.now())).fetchall()
+                items.append({
+                    "id": row["id"], "kind": row["kind"], "state": row["state"],
+                    "patient_id": row["patient_id"], "staff_id": row["staff_id"],
+                    "starts_at": row["starts_at"], "ends_at": row["ends_at"],
+                    "local_starts_at": self.resources.local_view(connection, clinic_id, row["starts_at"])["local"],
+                    "local_ends_at": self.resources.local_view(connection, clinic_id, row["ends_at"])["local"],
+                    "resources": [{"kind": link["kind"], "name": link["name"],
+                                   "blocked_from": link["blocked_from"], "blocked_until": link["blocked_until"],
+                                   "blocked_local_from": self.resources.local_view(connection, clinic_id, link["blocked_from"])["local"],
+                                   "blocked_local_until": self.resources.local_view(connection, clinic_id, link["blocked_until"])["local"]}
+                                  for link in links]})
+            return {"clinic_id": clinic_id, "local_date": local_day.isoformat(), "timezone": zone.key,
+                    "window": {"starts_at": start_text, "ends_at": end_text,
+                               "local_starts_at": window_start.astimezone(zone).isoformat(timespec="seconds"),
+                               "local_ends_at": window_end.astimezone(zone).isoformat(timespec="seconds")},
+                    "appointments": items}
 
     def schedule_followup(self, clinic_id: str, actor_id: str, patient_id: str, due_at: str,
                           reason: str, key: str, *, plan_id: str | None = None,

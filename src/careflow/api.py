@@ -173,11 +173,46 @@ def create_handler(app: Careflow):
                 key = self.headers.get("Idempotency-Key", "")
                 return app.create_appointment(clinic_id, actor_id, data.get("patient_id", ""), data.get("kind", ""),
                                               data.get("starts_at", ""), data.get("ends_at", ""), key,
-                                              staff_id=data.get("staff_id"), plan_id=data.get("plan_id")), 201
+                                              staff_id=data.get("staff_id"), plan_id=data.get("plan_id"),
+                                              resource_ids=data.get("resource_ids")), 201
+            if len(segments) == 3 and segments[0] == "appointments" and segments[2] == "reschedule" and self.command == "POST":
+                data = self.body()
+                return app.reschedule_appointment(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
+                                                  data.get("starts_at", ""), data.get("ends_at", ""),
+                                                  resource_ids=data.get("resource_ids"),
+                                                  reason=data.get("reason")), 200
+            if self.command == "GET" and segments == ["appointments", "calendar"]:
+                params = parse_qs(path.query)
+                return app.appointment_calendar(clinic_id, actor_id, params.get("date", [""])[0]), 200
+            if self.command == "GET" and segments == ["appointments", "conflicts"]:
+                params = parse_qs(path.query)
+                raw_ids = params.get("resource_ids", [""])[0]
+                return app.appointment_conflicts(clinic_id, actor_id,
+                                                 params.get("starts_at", [""])[0], params.get("ends_at", [""])[0],
+                                                 staff_id=params.get("staff_id", [None])[0] or None,
+                                                 resource_ids=[item for item in raw_ids.split(",") if item],
+                                                 exclude_appointment_id=params.get("exclude_appointment_id", [None])[0] or None), 200
             if len(segments) == 3 and segments[0] == "appointments" and self.command == "POST":
                 data = self.body()
                 return app.transition_appointment(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
                                                   segments[2], reason=data.get("reason")), 200
+            if self.command == "POST" and segments == ["resources", "rooms"]:
+                data = self.body()
+                return app.resources.register_room(clinic_id, actor_id, data.get("name", ""),
+                                                   turnover_minutes=data.get("turnover_minutes")), 201
+            if self.command == "POST" and segments == ["resources", "devices"]:
+                data = self.body()
+                return app.resources.register_device(clinic_id, actor_id, data.get("name", ""),
+                                                     turnover_minutes=data.get("turnover_minutes")), 201
+            if self.command == "GET" and segments == ["resources"]:
+                params = parse_qs(path.query)
+                return {"items": app.resources.list_resources(clinic_id, actor_id,
+                                                              kind=params.get("kind", [None])[0])}, 200
+            if len(segments) == 3 and segments[0] == "resources" and segments[2] == "disable" and self.command == "POST":
+                data = self.body()
+                return app.resources.disable_resource(clinic_id, actor_id, segments[1],
+                                                      data.get("expected_version", 0),
+                                                      reason=data.get("reason", "")), 200
             if self.command == "POST" and segments == ["followups"]:
                 data = self.body()
                 return app.schedule_followup(clinic_id, actor_id, data.get("patient_id", ""), data.get("due_at", ""),

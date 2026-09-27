@@ -50,6 +50,7 @@ class ConsistencyChecker:
         self.check_incident_ledger()
         self.check_signed_records()
         self.check_duplicate_active_reservations()
+        self.check_resource_allocations()
         chain = audit.verify_chain(self.connection, self.clinic_id)
         if not chain["ok"]:
             self.add("audit.chain_mismatch", "critical", "clinic", self.clinic_id,
@@ -219,6 +220,57 @@ class ConsistencyChecker:
                      {"appointments": [row["first_id"], row["second_id"]],
                       "intervals": [[row["starts_at"], row["first_end"]], [row["second_start"], row["second_end"]]]},
                      "联系诊所排班负责人核对是否为合法协同服务或重复占用。")
+
+    def check_resource_allocations(self) -> None:
+        """同一资源在重叠窗口内只能有一条仍阻塞的占用；终态预约不应继续占房/设备。"""
+        rows = self.connection.execute(
+            "SELECT x.resource_id,r.name AS resource_name,r.kind AS resource_kind,"
+            "x.appointment_id AS first_id,y.appointment_id AS second_id,"
+            "x.blocked_from AS first_from,x.blocked_until AS first_until,"
+            "y.blocked_from AS second_from,y.blocked_until AS second_until "
+            "FROM appointment_resources x "
+            "JOIN appointment_resources y ON x.resource_id=y.resource_id AND x.appointment_id<y.appointment_id "
+            "JOIN clinic_resources r ON r.id=x.resource_id "
+            "JOIN appointments a1 ON a1.id=x.appointment_id "
+            "JOIN appointments a2 ON a2.id=y.appointment_id "
+            "WHERE x.clinic_id=? "
+            "AND (x.released_at IS NULL OR x.released_at>?) AND (y.released_at IS NULL OR y.released_at>?) "
+            "AND x.blocked_from<y.blocked_until AND x.blocked_until>y.blocked_from "
+            "AND (a1.state!='held' OR a1.hold_expires_at IS NULL OR a1.hold_expires_at>?) "
+            "AND (a2.state!='held' OR a2.hold_expires_at IS NULL OR a2.hold_expires_at>?) "
+            "AND a1.state NOT IN ('cancelled','no_show') AND a2.state NOT IN ('cancelled','no_show') "
+            "ORDER BY x.resource_id,x.blocked_from,x.appointment_id",
+            (self.clinic_id, self.as_of, self.as_of, self.as_of, self.as_of)).fetchall()
+        for row in rows:
+            self.add("resource.double_booked", "high", "resource", row["resource_id"],
+                     {"resource_kind": row["resource_kind"], "resource_name": row["resource_name"],
+                      "appointments": [row["first_id"], row["second_id"]],
+                      "windows": [[row["first_from"], row["first_until"]],
+                                  [row["second_from"], row["second_until"]]]},
+                     "核对资源占用与清洁准备间隔，重新安排其中一项预约。")
+        rows = self.connection.execute(
+            "SELECT ar.id,ar.appointment_id,ar.resource_id,a.state AS appointment_state "
+            "FROM appointment_resources ar JOIN appointments a ON a.id=ar.appointment_id "
+            "LEFT JOIN clinic_resources r ON r.id=ar.resource_id "
+            "WHERE ar.clinic_id=? AND (ar.released_at IS NULL OR ar.released_at>?) "
+            "AND a.state IN ('held','booked','arrived','in_service') "
+            "AND (r.id IS NULL OR r.state='disabled') ORDER BY ar.id",
+            (self.clinic_id, self.as_of)).fetchall()
+        for row in rows:
+            self.add("resource.binding_invalid", "medium", "appointment_resource", row["id"],
+                     {"appointment_id": row["appointment_id"], "resource_id": row["resource_id"],
+                      "appointment_state": row["appointment_state"]},
+                     "资源已停用或删除，联系排班员为该预约改配有效资源。")
+        rows = self.connection.execute(
+            "SELECT ar.id,ar.appointment_id,ar.resource_id,a.state AS appointment_state "
+            "FROM appointment_resources ar JOIN appointments a ON a.id=ar.appointment_id "
+            "WHERE ar.clinic_id=? AND ar.released_at IS NULL AND a.state IN ('cancelled','no_show') "
+            "ORDER BY ar.id", (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("resource.terminal_holds_resource", "medium", "appointment_resource", row["id"],
+                     {"appointment_id": row["appointment_id"], "resource_id": row["resource_id"],
+                      "appointment_state": row["appointment_state"]},
+                     "终态预约不应无限期占用资源，核对释放规则后释放该占位。")
 
 
 def clinic_diagnostics(connection, clinic_id: str, as_of: str) -> dict[str, Any]:

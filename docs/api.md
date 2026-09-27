@@ -21,9 +21,19 @@
 
 评估签署后不可覆盖。就诊病历由章节组成，签署需要主诉、评估和计划三部分；签署后的补充内容成为新版本，原始文字仍保留。
 
-## 预约、随访与计划节点
+## 预约、资源与随访
 
-创建预约须提供 `Idempotency-Key`，有责任人的预约不能与未结束时段重叠。临时占位到期后由 `POST /appointments/{id}/book` 拒绝确认，过期占位可通过服务方法按限额释放。预约状态按占位、确认、到诊、服务、完成推进；开始服务时产生就诊记录。
+创建预约须提供 `Idempotency-Key`；除 `staff_id` 外还可指定 `room_id` 与 `device_ids`，人员、诊室（含清洁准备间隔）与治疗设备统一纳入资源占用，任一资源在时段内被占用即整笔创建失败，响应 `409` 的 `details.conflicts` 逐项说明冲突来自哪个资源（`resource_type`/`resource_id`/`resource_name`）和哪个时间段（`occupied_from`/`occupied_until`）。创建响应返回每项资源的当前版本（`resource_versions`）与诊所时区展示字段（`local`，含跨午夜与夏令时切换标注）。
+
+- `POST /rooms`、`POST /rooms/{id}/update` 登记诊室并调整清洁准备间隔（0–480 分钟）或停用；`POST /devices`、`POST /devices/{id}/update` 登记与停用设备。调整与停用都会递增资源版本。
+- `POST /appointments/{id}/book` 确认预约时同时锁定人员、房间与设备：调用方应回传创建时获得的 `resource_versions`，任一资源版本变化（或资源被停用、时段被占）都会让整次确认失败，临时占位随同事务释放，预约转为取消并记录 `appointment.book_failed` 审计事件。
+- `POST /appointments/{id}/reschedule` 以 `expected_version` 原子改期：同一事务内释放旧资源并占用新资源（可一并更换 `room_id`/`device_ids`），冲突或校验失败时整体回滚、保留原预约。
+- `GET /appointments/{id}` 返回预约及其资源占用明细。
+- `GET /calendar?date=YYYY-MM-DD` 按诊所时区的运营日展示预约；跨越当地午夜或夏令时切换的预约带有 `crosses_local_midnight`、`spans_dst_transition` 与起止 UTC 偏移标注，重叠判断始终基于 UTC 时间线。
+- `GET /resources` 列出台账；`GET /resources/schedule?date=…` 按资源列出占用块并报告当日冲突来自哪个资源和哪个时间段。
+- `POST /appointments/release-resources` 释放到期的延迟占用（未到诊诊室、完成服务后的清洁间隔）。
+
+取消、未到诊与完成服务采用不同的释放规则：取消（含占位到期）立即释放全部资源；未到诊立即释放人员与设备，诊室保留到原定结束时刻且不再追加清洁间隔；完成服务立即释放人员与设备，诊室保留到清洁准备间隔结束，到期后由释放接口或诊断巡检清理。预约状态按占位、确认、到诊、服务、完成推进；开始服务时产生就诊记录。
 
 随访和计划节点支持领取租约、版本校验、幂等创建、延期和完整处置历史。旧领取者不能以过期令牌提交结果；重新领取不会删除前次领取事件。
 

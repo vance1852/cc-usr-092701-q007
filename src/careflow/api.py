@@ -173,11 +173,48 @@ def create_handler(app: Careflow):
                 key = self.headers.get("Idempotency-Key", "")
                 return app.create_appointment(clinic_id, actor_id, data.get("patient_id", ""), data.get("kind", ""),
                                               data.get("starts_at", ""), data.get("ends_at", ""), key,
-                                              staff_id=data.get("staff_id"), plan_id=data.get("plan_id")), 201
+                                              staff_id=data.get("staff_id"), plan_id=data.get("plan_id"),
+                                              room_id=data.get("room_id"), device_ids=data.get("device_ids")), 201
+            if self.command == "POST" and segments == ["appointments", "release-resources"]:
+                data = self.body()
+                return app.resources.release_due_resources(clinic_id, actor_id, limit=data.get("limit", 200)), 200
+            if len(segments) == 2 and segments[0] == "appointments" and self.command == "GET":
+                return app.get_appointment(clinic_id, actor_id, segments[1]), 200
+            if len(segments) == 3 and segments[0] == "appointments" and segments[2] == "reschedule" and self.command == "POST":
+                data = self.body()
+                return app.reschedule_appointment(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
+                                                  data.get("starts_at", ""), data.get("ends_at", ""),
+                                                  room_id=data.get("room_id"), device_ids=data.get("device_ids"),
+                                                  reason=data.get("reason")), 200
             if len(segments) == 3 and segments[0] == "appointments" and self.command == "POST":
                 data = self.body()
                 return app.transition_appointment(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
-                                                  segments[2], reason=data.get("reason")), 200
+                                                  segments[2], reason=data.get("reason"),
+                                                  expected_resource_versions=data.get("resource_versions")), 200
+            if self.command == "POST" and segments == ["rooms"]:
+                data = self.body()
+                return app.resources.register_room(clinic_id, actor_id, data.get("name", ""), data.get("kind", ""),
+                                                   turnover_minutes=data.get("turnover_minutes", 0)), 201
+            if len(segments) == 3 and segments[0] == "rooms" and segments[2] == "update" and self.command == "POST":
+                data = self.body()
+                return app.resources.update_room(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
+                                                 turnover_minutes=data.get("turnover_minutes"),
+                                                 active=data.get("active")), 200
+            if self.command == "POST" and segments == ["devices"]:
+                data = self.body()
+                return app.resources.register_device(clinic_id, actor_id, data.get("name", ""), data.get("kind", "")), 201
+            if len(segments) == 3 and segments[0] == "devices" and segments[2] == "update" and self.command == "POST":
+                data = self.body()
+                return app.resources.update_device(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
+                                                   active=data.get("active")), 200
+            if self.command == "GET" and segments == ["resources"]:
+                return app.resources.list_resources(clinic_id, actor_id), 200
+            if self.command == "GET" and segments == ["resources", "schedule"]:
+                params = parse_qs(path.query)
+                return app.resources.resource_schedule(clinic_id, actor_id, params.get("date", [None])[0]), 200
+            if self.command == "GET" and segments == ["calendar"]:
+                params = parse_qs(path.query)
+                return app.resources.calendar(clinic_id, actor_id, params.get("date", [None])[0]), 200
             if self.command == "POST" and segments == ["followups"]:
                 data = self.body()
                 return app.schedule_followup(clinic_id, actor_id, data.get("patient_id", ""), data.get("due_at", ""),

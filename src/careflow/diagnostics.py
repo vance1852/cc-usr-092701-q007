@@ -50,6 +50,8 @@ class ConsistencyChecker:
         self.check_incident_ledger()
         self.check_signed_records()
         self.check_duplicate_active_reservations()
+        self.check_resource_overlaps()
+        self.check_stale_resource_locks()
         chain = audit.verify_chain(self.connection, self.clinic_id)
         if not chain["ok"]:
             self.add("audit.chain_mismatch", "critical", "clinic", self.clinic_id,
@@ -219,6 +221,54 @@ class ConsistencyChecker:
                      {"appointments": [row["first_id"], row["second_id"]],
                       "intervals": [[row["starts_at"], row["first_end"]], [row["second_start"], row["second_end"]]]},
                      "联系诊所排班负责人核对是否为合法协同服务或重复占用。")
+
+    def check_resource_overlaps(self) -> None:
+        """扫描诊室与设备（含清洁准备间隔）的双重占用，并指出冲突资源与时间段。"""
+        rows = self.connection.execute(
+            "SELECT a.resource_type,a.resource_id,a.appointment_id AS first_id,a.occupied_from,a.occupied_until AS first_end,"
+            "b.appointment_id AS second_id,b.occupied_from AS second_start,b.occupied_until AS second_end "
+            "FROM appointment_resources a JOIN appointment_resources b "
+            "ON a.clinic_id=b.clinic_id AND a.resource_type=b.resource_type AND a.resource_id=b.resource_id AND a.id<b.id "
+            "JOIN appointments aa ON aa.id=a.appointment_id JOIN appointments ab ON ab.id=b.appointment_id "
+            "WHERE a.clinic_id=? AND a.resource_type IN ('room','device') AND a.state IN ('held','booked') AND b.state IN ('held','booked') "
+            "AND (aa.state IN ('held','booked','arrived','in_service') OR (a.release_due_at IS NOT NULL AND a.release_due_at>?)) "
+            "AND (ab.state IN ('held','booked','arrived','in_service') OR (b.release_due_at IS NOT NULL AND b.release_due_at>?)) "
+            "AND (aa.state!='held' OR aa.hold_expires_at IS NULL OR aa.hold_expires_at>?) "
+            "AND (ab.state!='held' OR ab.hold_expires_at IS NULL OR ab.hold_expires_at>?) "
+            "AND a.occupied_from<b.occupied_until AND a.occupied_until>b.occupied_from "
+            "ORDER BY a.resource_type,a.resource_id,a.occupied_from,a.id",
+            (self.clinic_id, self.as_of, self.as_of, self.as_of, self.as_of)).fetchall()
+        names = {}
+        for row in rows:
+            key = (row["resource_type"], row["resource_id"])
+            if key not in names:
+                table = "rooms" if row["resource_type"] == "room" else "devices"
+                found = self.connection.execute(f"SELECT name FROM {table} WHERE id=?", (row["resource_id"],)).fetchone()
+                names[key] = found["name"] if found else None
+            self.add(f"appointment.{row['resource_type']}_overlap", "high", "resource_schedule", row["resource_id"],
+                     {"resource_type": row["resource_type"], "resource_name": names[key],
+                      "appointments": [row["first_id"], row["second_id"]],
+                      "intervals": [[row["occupied_from"], row["first_end"]], [row["second_start"], row["second_end"]]],
+                      "overlap": [max(row["occupied_from"], row["second_start"]),
+                                  min(row["first_end"], row["second_end"])]},
+                     "核对诊室清洁准备间隔或设备排期，确认重复占用后释放其中一方资源。")
+
+    def check_stale_resource_locks(self) -> None:
+        """终态预约仍持有应释放的资源，或延迟释放到期仍未释放时报告。"""
+        rows = self.connection.execute(
+            "SELECT r.id,r.appointment_id,r.resource_type,r.resource_id,r.state,r.release_due_at,a.state AS appointment_state "
+            "FROM appointment_resources r JOIN appointments a ON a.id=r.appointment_id WHERE r.clinic_id=? "
+            "AND r.state IN ('held','booked') AND ("
+            "a.state='cancelled' "
+            "OR (a.state IN ('no_show','completed') AND r.resource_type!='room') "
+            "OR (r.release_due_at IS NOT NULL AND r.release_due_at<=?)) ORDER BY r.id",
+            (self.clinic_id, self.as_of)).fetchall()
+        for row in rows:
+            self.add("appointment.resource_lock_stale", "high", "appointment_resource", row["id"],
+                     {"appointment_id": row["appointment_id"], "appointment_state": row["appointment_state"],
+                      "resource_type": row["resource_type"], "resource_id": row["resource_id"],
+                      "state": row["state"], "release_due_at": row["release_due_at"]},
+                     "运行延迟释放清理或核对终态释放规则，确保资源可继续排班。")
 
 
 def clinic_diagnostics(connection, clinic_id: str, as_of: str) -> dict[str, Any]:

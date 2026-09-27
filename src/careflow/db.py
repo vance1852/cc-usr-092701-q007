@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -174,6 +174,46 @@ CREATE TABLE IF NOT EXISTS appointments (
 );
 CREATE INDEX IF NOT EXISTS appointments_schedule ON appointments(clinic_id,starts_at,ends_at,state);
 CREATE INDEX IF NOT EXISTS appointments_patient ON appointments(patient_id,starts_at DESC);
+CREATE TABLE IF NOT EXISTS rooms (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('consult','treatment','recovery')),
+    turnover_minutes INTEGER NOT NULL DEFAULT 0 CHECK(turnover_minutes>=0 AND turnover_minutes<=480),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(clinic_id,name)
+);
+CREATE TABLE IF NOT EXISTS devices (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(clinic_id,name)
+);
+CREATE TABLE IF NOT EXISTS appointment_resources (
+    id TEXT PRIMARY KEY,
+    appointment_id TEXT NOT NULL REFERENCES appointments(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    resource_type TEXT NOT NULL CHECK(resource_type IN ('staff','room','device')),
+    resource_id TEXT NOT NULL,
+    occupied_from TEXT NOT NULL,
+    occupied_until TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('held','booked','released')),
+    release_due_at TEXT,
+    released_at TEXT,
+    release_reason TEXT,
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS appointment_resources_active
+    ON appointment_resources(appointment_id,resource_type,resource_id) WHERE state IN ('held','booked');
+CREATE INDEX IF NOT EXISTS appointment_resources_span ON appointment_resources(clinic_id,resource_type,resource_id,state,occupied_from,occupied_until);
+CREATE INDEX IF NOT EXISTS appointment_resources_release ON appointment_resources(state,release_due_at);
 CREATE TABLE IF NOT EXISTS products (
     id TEXT PRIMARY KEY,
     clinic_id TEXT NOT NULL REFERENCES clinics(id),
